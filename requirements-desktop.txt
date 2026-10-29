@@ -1,0 +1,6 @@
+# 桌面程序（托盘）额外依赖。网关本身只需要 requirements.txt 里的东西。
+#   pip install -r requirements-desktop.txt
+pystray>=0.19
+pillow>=10.0
+# 仅打包 exe 时需要；只用脚本跑托盘可以不装。
+pyinstaller>=6.0
