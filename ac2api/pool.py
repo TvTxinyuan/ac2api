@@ -247,8 +247,17 @@ class AccountPool:
             self._sessions[session_key] = (acc.key, now + SESSION_TTL_S)
         return acc
 
-    def release(self, account: Account | str, *, success: bool = True, error: str = "") -> None:
-        """归还租约；失败时记录连续失败并安排退避，成功则清零。"""
+    def release(self, account: Account | str, *, success: bool = True, error: str = "",
+                blame_account: bool = True) -> None:
+        """归还租约；失败时记录连续失败并安排退避，成功则清零。
+
+        `blame_account=False` 用于「账号本身没毛病、是请求被上游判不合规」的失败
+        （典型是 406）。这类错误换号也没用，而且**冷却账号是有害的**：单账号池下
+        冷却期内所有请求都会撞上 `NoAccountAvailable` 变成 503，把一个「请求格式
+        问题」放大成「服务不可用」。所以只记 last_error，不动冷却与失败计数。
+
+        租约永远会被归还（`in_flight` 必减），只有冷却与否受 `blame_account` 影响。
+        """
         key = account if isinstance(account, str) else account.key
         with self._mutex:
             acc = self._accounts.get(key)
@@ -260,6 +269,9 @@ class AccountPool:
                 acc.last_error = ""
                 return
             acc.last_error = error[:300]
+            if not blame_account:
+                # 请求侧的问题：账号照常可用，不计入连续失败、不打冷却。
+                return
             streak = self._fail_streak.get(key, 0) + 1
             self._fail_streak[key] = streak
             acc.cooling_until = time.time() + self.backoff_seconds(streak)

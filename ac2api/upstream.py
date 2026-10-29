@@ -168,6 +168,28 @@ BLOCKED_IDENTITY_PATTERN = re.compile(r"(?i)\byou are (?P<who>codex|claude code)
 #: 命中 :data:`BLOCKED_IDENTITY_PATTERN` 后替换成的中性写法。
 IDENTITY_REPLACEMENT = "You are a terminal coding agent"
 
+#: 上游拦的**整句**竞品身份声明 —— 只按字面子串匹配，独立于上面两条规则。
+#:
+#: 实测（2026-10-30，真账号，system 前缀合规、每次只改追加的一句话）：
+#:   * "You are an AI agent powered by DeepSeek Harness."     -> 406
+#:   * "you are an ai agent powered by deepseek harness."     -> 406（大小写不敏感）
+#:   * "You are an AI agent powered by DeepSeek Harness"      -> 406（句号可有可无）
+#:   * "You are an AI agent powered by X Harness."            -> 200
+#:   * "You are an AI agent powered by DeepSeek X."           -> 200
+#:   * "You are an AI assistant powered by DeepSeek Harness." -> 200（AI agent 不能变）
+#:   * "Youre an AI agent powered by DeepSeek Harness."       -> 200（You are 不能断）
+#:   * "You are an  AI agent …"（两个空格）                    -> 200（内部必须单空格）
+#:   * 单独出现 "DeepSeek" / "DeepSeek Harness" / "Harness"     -> 200
+#:   * 单独出现 "You are an AI agent" / "powered by"            -> 200
+#:
+#: 也就是说：**整句连起来**才命中，拆散或改动任一词都放行 —— 典型字面子串
+#: 匹配。DSH（DeepSeek Harness）的 system prompt 开场就是这一句，而它正是
+#: ac2api 最常见的调用方，所以不洗掉就每次对话都 406。
+BLOCKED_AGENT_LINES: tuple[tuple[str, str], ...] = (
+    ("you are an ai agent powered by deepseek harness",
+     "You are an AI agent"),
+)
+
 #: 这些状态码意味着「换个号还有救」。
 RETRYABLE_STATUS = {401, 402, 403, 408, 425, 429, 500, 502, 503, 504}
 
@@ -663,9 +685,24 @@ def scrub_identity(text: str) -> str:
     return BLOCKED_IDENTITY_PATTERN.sub(IDENTITY_REPLACEMENT, text)
 
 
+def scrub_agent_lines(text: str) -> str:
+    """洗掉上游按**整句**拉黑的竞品身份声明（见 :data:`BLOCKED_AGENT_LINES`）。
+
+    与 :func:`scrub_identity` 的区别：那条匹配的是 `You are <名字>` 句式，这条
+    匹配的是一整句话，且**内部必须是单空格**（换成双空格上游就不拦了，说明是
+    字面子串比较而不是分词）。所以这里只做大小写不敏感，不做空白归一化 ——
+    归一化反而会把上游本来放行的写法也改掉。
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    for phrase, replacement in BLOCKED_AGENT_LINES:
+        text = re.sub(re.escape(phrase), replacement, text, flags=re.IGNORECASE)
+    return text
+
+
 def scrub_text(text: str) -> str:
-    """两条竞品规则一起过（先洗 `You are …` 句式，再洗词）。"""
-    return scrub_agent_phrases(scrub_identity(text))
+    """三条竞品规则一起过（整句 → `You are …` 句式 → 词）。"""
+    return scrub_agent_phrases(scrub_identity(scrub_agent_lines(text)))
 
 
 def _scrub_message(msg: dict) -> dict:
@@ -1067,6 +1104,7 @@ class UpstreamClient:
 
         text = resp.text
         if resp.status_code >= 400:
+            _dump_response(resp.status_code, dict(resp.headers), text, "json")
             self._raise_for_status(resp.status_code, text)
         try:
             return json.loads(text)
@@ -1091,6 +1129,7 @@ class UpstreamClient:
             ) as resp:
                 if resp.status_code >= 400:
                     raw = (await resp.aread()).decode("utf-8", "replace")
+                    _dump_response(resp.status_code, dict(resp.headers), raw, "stream")
                     self._raise_for_status(resp.status_code, raw)
                 async for chunk in resp.aiter_bytes():
                     if chunk:
@@ -1111,13 +1150,22 @@ class UpstreamClient:
             if self._sign_error:
                 hint = f"客户端签名握手失败：{self._sign_error}"
             else:
-                hint = ("上游 406：请求被 AutoClaw 网关判为不合规。最常见原因是 system "
-                        f"prompt 不以「{REQUIRED_SYSTEM_PREFIX}」开头（网关做前缀校验，"
-                        "少一个字符就 406）；网关会自动补齐，如果仍报错请检查是否把 "
-                        "messages 里的 system 放在了下标 0 之外，或上游校验规则已变更。"
-                        "详见 README「system prompt 与 406」")
+                hint = ("上游 406：请求被 AutoClaw 网关判为不合规。最常见的成因是 system "
+                        f"prompt 不以「{REQUIRED_SYSTEM_PREFIX}」开头（网关做前缀校验）；"
+                        "网关已自动补齐 system 前缀，所以看到这条通常说明："
+                        "① 上游偶发风控（同一份请求体重放常能成功，可直接重试）；"
+                        "② 对话历史里带了竞品客户端字样，触发上游内容校验；"
+                        "③ 上游校验规则已变更。详见 README「system prompt 与 406」")
+            # **必须可重试**。2026-10-30 实测：同一份 17629 字节、sha256 完全
+            # 相同的请求体，连发两次，一次 406 一次 200；连续 8 次里 2 次 406、
+            # 6 次 200。说明它大部分情况下是上游的**偶发风控**而不是请求写错，
+            # 重试才是正解。以前这里写 retryable=False，导致网关不重试、直接把
+            # 406 抛给调用方 —— 一个「重放就好」的抖动被放大成了硬失败。
+            # 反过来说：真写错了（前缀缺失等）时，重试也会稳定 406，只是多花
+            # 两次上游往返，这个代价远小于把偶发风控变成必现故障。
             raise UpstreamError(f"upstream 406（请求不合规）：{hint}",
-                                status_code=406, body=text[:2000], retryable=False, code="bad_request")
+                                status_code=406, body=text[:2000], retryable=True,
+                                code="upstream_406")
         kind, rotate = FAILURE_MAP.get((status, service_code), ("", False))
         if not kind:
             kind, rotate = FAILURE_MAP.get((status, ""), ("", False))
@@ -1280,6 +1328,29 @@ class UpstreamClient:
         except ValueError as err:
             raise UpstreamError(f"upstream returned non-JSON (HTTP {resp.status_code})",
                                 body=resp.text[:2000]) from err
+
+
+def _dump_response(status: int, headers: dict, text: str, tag: str) -> None:
+    """`AC2API_DEBUG_DUMP=<目录>` 时把上游的错误响应（头 + body）落盘。
+
+    406 的 body 是空的，就地排查时除了状态码什么都拿不到 —— 上游有时只把
+    线索放在响应头里（trace / 校验项），落盘才有得看。失败不影响主流程。
+    """
+    path = os.environ.get("AC2API_DEBUG_DUMP", "")
+    if not path:
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+        name = os.path.join(path, f"{stamp}-resp{status}-{tag}.txt")
+        with open(name, "w", encoding="utf-8") as fp:
+            fp.write(f"HTTP {status}\n")
+            for k, v in sorted(headers.items()):
+                fp.write(f"{k}: {v}\n")
+            fp.write("\n--- body ---\n")
+            fp.write(text or "<empty>")
+    except Exception:  # noqa: BLE001 - 调试功能绝不影响请求
+        pass
 
 
 def _service_code(text: str) -> str:

@@ -219,6 +219,34 @@ def test_pool() -> None:
     p3.upsert(Account(key="k", token="t2", summary=summarize_account([], now)))
     check("刷新积分不清在途", p3.get("k").in_flight == 1 and p3.get("k").token == "t2")
 
+    # 请求侧错误不该冷却账号（回归：406 → 冷却 → 单账号下全撞 503）
+    #
+    # 实测事故（2026-10-30）：DSH 发来 212 条消息的请求被判 406，网关把它当「账号
+    # 失败」打上指数冷却；单账号池下冷却期内所有请求都变成 503「没有可用的 AutoClaw
+    # 账号」，把「你请求写错了」放大成「服务不可用」。而同一份请求体（sha256 一致）
+    # 隔 71 秒原样重放就 200 —— 406 与账号健康状况无关。
+    p4 = AccountPool(accounts=[Account(key="solo", token="t", summary=rich.summary)])
+    held4 = p4.pick()
+    p4.release(held4, success=False, error="UpstreamError: upstream 406", blame_account=False)
+    check("406 不打冷却", p4.get("solo").cooling_until == 0.0, p4.get("solo").cooling_until)
+    check("406 不计连续失败", p4._fail_streak.get("solo", 0) == 0, p4._fail_streak)
+    # 租约必须归还：不冷却不等于不释放，否则这个号就永远在途了
+    check("406 仍归还租约", p4.get("solo").in_flight == 0, p4.get("solo").in_flight)
+    time.sleep(MIN_PICK_GAP_S * 1.5)
+    try:
+        again = p4.pick(wait_s=0.5)
+        check("406 之后立刻还能选到号", again.key == "solo", again.key)
+        p4.release(again)
+    except NoAccountAvailable as err:
+        check("406 之后立刻还能选到号", False, err)
+
+    # 对照组：账号真出问题时仍然要冷却，别把修复做成「永不冷却」
+    p5 = AccountPool(accounts=[Account(key="solo", token="t", summary=rich.summary)])
+    held5 = p5.pick()
+    p5.release(held5, success=False, error="UpstreamAuthError: 401")
+    check("账号类错误仍然冷却", p5.get("solo").cooling_until > 0.0, p5.get("solo").cooling_until)
+    check("账号类错误计入连续失败", p5._fail_streak.get("solo", 0) == 1, p5._fail_streak)
+
 
 def test_keys() -> None:
     print("[keys] 哈希 / 配额 / 速率")
@@ -550,6 +578,70 @@ def test_blocked_phrases() -> None:
     check("多模态块也清洗", "claude code" not in block["text"].lower(), block["text"])
 
 
+def test_blocked_lines() -> None:
+    """上游还按**整句**拦竞品身份：DSH 的 "You are an AI agent powered by DeepSeek
+    Harness." 连起来就 406，拆散任一处就放行（字面子串比较，非分词）。"""
+    from ac2api.upstream import (BLOCKED_AGENT_LINES, REQUIRED_SYSTEM_PREFIX,
+                                 ensure_system_prompt, scrub_agent_lines, scrub_text)
+
+    print("[upstream] 竞品整句身份清洗（406 修复之五：DSH）")
+
+    phrases = [p for p, _ in BLOCKED_AGENT_LINES]
+    check("黑名单里有 DSH 那句",
+          "you are an ai agent powered by deepseek harness" in phrases, phrases)
+
+    # 实测 406 的写法：大小写不敏感、句号可有可无、内部必须单空格
+    blocked = ("You are an AI agent powered by DeepSeek Harness.",
+               "you are an ai agent powered by deepseek harness",
+               "You are an AI agent powered by DeepSeek Harness",
+               "YOU ARE AN AI AGENT POWERED BY DEEPSEEK HARNESS.")
+    for text in blocked:
+        out = scrub_agent_lines(text)
+        check(f"拦：{text[:34]!r}",
+              "deepseek harness" not in out.lower(), out[:40])
+
+    # 实测放行的写法（改动任一处上游就不拦，这里也不能误伤）
+    allowed = ("You are an AI agent powered by X Harness.",
+               "You are an AI agent powered by DeepSeek X.",
+               "You are an AI assistant powered by DeepSeek Harness.",
+               "Youre an AI agent powered by DeepSeek Harness.",
+               "You are an  AI agent powered by DeepSeek Harness.",
+               "an AI agent powered by DeepSeek Harness.",
+               "DeepSeek Harness", "powered by",
+               "You are an AI agent", "DeepSeek")
+    for text in allowed:
+        check(f"放：{text[:34]!r}", scrub_agent_lines(text) == text)
+
+    # 替换后不能残留竞品名，且句子仍然读得通（原句的句号会被保留）
+    out = scrub_agent_lines("You are an AI agent powered by DeepSeek Harness.")
+    check("替换成中性身份", out == "You are an AI agent.", repr(out))
+
+    check("空串不炸", scrub_agent_lines("") == "")
+    check("None 不炸", scrub_agent_lines(None) is None)
+
+    # scrub_text 三条规则一起过
+    combo = "You are an AI agent powered by DeepSeek Harness. You are Codex. Running in the Codex CLI."
+    cleaned = scrub_text(combo)
+    low = cleaned.lower()
+    check("组合：无 deepseek harness", "deepseek harness" not in low, low[:60])
+    check("组合：无 you are codex", "you are codex" not in low, low[:60])
+    check("组合：无 codex cli", "codex cli" not in low, low[:60])
+
+    # 端到端：DSH 真实 system（前缀合规 + 开场就是那句）必须能过上游
+    dsh_system = (f"{REQUIRED_SYSTEM_PREFIX}\n"
+                  "You are an AI agent powered by DeepSeek Harness.\n\n"
+                  "You are a coding agent powered by the zaicoding_glm-5.3 model.")
+    body = {"model": "zaicoding_glm-5.3",
+            "messages": [{"role": "system", "content": dsh_system},
+                         {"role": "user", "content": "hi"}]}
+    fixed = ensure_system_prompt(body)
+    system = fixed["messages"][0]["content"]
+    check("DSH system 仍带前缀", system.startswith(REQUIRED_SYSTEM_PREFIX), system[:60])
+    check("DSH system 已洗掉那句", "deepseek harness" not in system.lower(), system[:120])
+    check("DSH system 其余保留", "coding agent powered by the zaicoding_glm-5.3 model" in system)
+    check("不污染调用方", "DeepSeek Harness" in body["messages"][0]["content"])
+
+
 def test_store() -> None:
     print("[store] key 落盘 / 重载 / 坏文件容错")
     import tempfile
@@ -709,6 +801,7 @@ def main() -> int:
     test_max_tokens()
     test_identity_phrase()
     test_blocked_phrases()
+    test_blocked_lines()
     test_store()
     test_data_dir_fallback()
     test_gateway_keys()

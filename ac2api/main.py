@@ -81,6 +81,35 @@ def _json_error(status: int, message: str, *, code: str = "", type_: str = "inva
     )
 
 
+def _blames_account(err: Exception) -> bool:
+    """这次失败该不该算到「账号」头上（要不要给它打冷却）。
+
+    **不该**的典型是上游 406：那是「请求被判定不合规」，账号本身没毛病，换号
+    也不会好。如果把 406 也算成账号失败，单账号池下一个请求格式问题就会让账号
+    进入指数冷却（0.5s→8s），期间所有请求都撞 `NoAccountAvailable` 变成 503 ——
+    把一个「你请求写错了」放大成「服务不可用」，排查时极易误判成上游故障。
+
+    实测（2026-10-30）：同一份 212 条消息的请求体，第一次 406、隔 71 秒原样重放
+    200，字节完全相同（sha256 一致），说明 406 与账号健康状况不相关。
+    """
+    if isinstance(err, UpstreamError) and err.status_code == 406:
+        return False
+    return True
+
+
+#: 406 在**同一个账号**上最多重试几次。
+#:
+#: 406 绝大多数时候是上游的偶发风控：实测同一份 17629 字节、sha256 完全相同的
+#: 请求体连发 8 次，2 次 406、6 次 200，且 406 与 200 交替出现，跟账号状态、
+#: 请求内容都无关。所以重试比换号有效（单账号池下换号根本没号可换，反而会撞
+#: `NoAccountAvailable` 变成 503）。取 4 次是因为实测单次 406 概率约 25%，
+#: 连挂 4 次的概率是 0.4% 量级，再往上加只是让用户多等。
+UPSTREAM_406_RETRIES = 4
+#: 406 重试之间的间隔（秒）。风控是短时的，稍等一下就过去了；
+#: 同时也避免「重试风暴」反过来把风控喂得更凶。
+UPSTREAM_406_BACKOFF_S = 0.6
+
+
 def sid_from_request(body: dict, request: Request) -> str | None:
     """会话粘性键：优先用调用方给的稳定标识，退化为 IP。
 
@@ -304,12 +333,53 @@ class Gateway:
         return payload
 
     async def forward(self, body: dict, account: Account, *, session_id: str = "") -> Any:
-        """对一个已选定的账号发起上游请求。"""
+        """对一个已选定的账号发起上游请求。
+
+        `stream` 照客户端的要求走：上游两种都接受（2026-10-30 复查，之前那句
+        「上游只接受流式」是误判 —— 当时把 406 当成了非流式特有的失败，实际
+        是请求体里的竞品身份句在触发，见 :data:`BLOCKED_AGENT_LINES`）。
+        """
         token = account.token or self.refresh_account_token(account)
         payload = self.prepare_payload(body)
         if payload.get("stream"):
             return self.upstream.chat_stream(token, payload, session_id=session_id)
         return await self.upstream.chat(token, payload)
+
+    async def forward_with_jitter_retry(self, body: dict, account: Account,
+                                        *, session_id: str = "") -> Any:
+        """在上游偶发风控（406）时，**同一个账号**上重试几次再放弃。
+
+        为什么不放进 `pick` 的循环里：那里重试意味着换号，而 406 跟账号无关。
+        单账号池下换号只会撞 `NoAccountAvailable` → 503（这正是之前「一次 200
+        之后连续 503」的成因之一）。所以 406 就地重试，失败只在最后一次抛出。
+
+        客户端要流式时，`chat_stream()` 是异步生成器，**创建它不会发请求**，
+        406 是在第一次迭代时才抛出的 —— 所以这里必须先把流的头读出来（读一
+        块）才能确认没被拦；确认之后才把生成器交回调用方继续透传。
+        """
+        want_stream = bool(body.get("stream"))
+        last: UpstreamError | None = None
+        for attempt in range(UPSTREAM_406_RETRIES + 1):
+            try:
+                result = await self.forward(body, account, session_id=session_id)
+                if want_stream:
+                    return _PrefixedStream(await _peek_first(result), result)
+                return result
+            except UpstreamError as err:
+                if err.status_code != 406:
+                    raise
+                last = err
+                if attempt >= UPSTREAM_406_RETRIES:
+                    break
+                self.log(UsageRecord(
+                    ts=time.time(), key_name="", account_key=account.key,
+                    model=str(body.get("model") or ""), stream=want_stream,
+                    status="retry", latency_ms=0,
+                    error=f"上游 406，重试 {attempt + 1}/{UPSTREAM_406_RETRIES}",
+                ))
+                await asyncio.sleep(UPSTREAM_406_BACKOFF_S * (attempt + 1))
+        assert last is not None
+        raise last
 
     # -- 统计 -------------------------------------------------------------
     def stats(self) -> dict:
@@ -506,21 +576,27 @@ def create_app(*, settings=None, gateway: Gateway | None = None,
                 break
             tried.append(account.key)
             try:
-                result = await gw.forward(body, account, session_id=sid or "")
+                result = await gw.forward_with_jitter_retry(body, account, session_id=sid or "")
             except (UpstreamAuthError, UpstreamQuotaError, UpstreamError) as err:
                 last_error = err
                 # 只有「换号有意义」的错误才继续重试；参数错误直接回给调用方。
-                gw.pool.release(account, success=False, error=f"{type(err).__name__}: {err}")
-                if isinstance(err, UpstreamError) and not err.retryable:
+                gw.pool.release(account, success=False, error=f"{type(err).__name__}: {err}",
+                                blame_account=_blames_account(err))
+                # 406 已经在同一账号上重试过 UPSTREAM_406_RETRIES 次了，换号也没用；
+                # 继续走外层循环只会把唯一账号塞进 `tried`、下一轮 pick 撞
+                # NoAccountAvailable → 503，把 406 掩盖成「没有可用账号」。
+                if isinstance(err, UpstreamError) and (not err.retryable or err.status_code == 406):
                     break
                 continue
             except Exception as err:  # noqa: BLE001
                 last_error = err
-                gw.pool.release(account, success=False, error=f"{type(err).__name__}: {err}")
+                gw.pool.release(account, success=False, error=f"{type(err).__name__}: {err}",
+                                blame_account=_blames_account(err))
                 continue
 
             if is_stream:
                 return await _stream_response(gw, auth, account, result, body, started, client_ip)
+            # 非流式：forward_with_jitter_retry 已经把流读完并聚合成 JSON。
             return _nonstream_response(gw, auth, account, result, body, started, client_ip)
 
         # 全试过了还是失败 / 池子空了
@@ -528,6 +604,11 @@ def create_app(*, settings=None, gateway: Gateway | None = None,
         status = 503
         if isinstance(last_error, UpstreamError):
             status = last_error.status_code if 400 <= last_error.status_code < 600 else 502
+            # 把上游原始响应体也带出去 —— 上游的错误码说明（如 406 的具体校验项）
+            # 只有它知道，网关自己的推断只能算猜测。
+            body_text = getattr(last_error, "body", "") or ""
+            if body_text and body_text.strip() and body_text.strip() not in message:
+                message = f"{message}\n\n上游原始响应：{body_text.strip()[:800]}"
         if isinstance(last_error, NoAccountAvailable):
             status, message = 503, "没有可用的 AutoClaw 账号（全部在途、冷却或积分耗尽）。"
         gw.log(UsageRecord(ts=time.time(), key_name=auth.name, account_key=",".join(tried) or "-",
@@ -596,21 +677,25 @@ def create_app(*, settings=None, gateway: Gateway | None = None,
                 break
             tried.append(account.key)
             try:
-                result = await gw.forward(chat_body, account, session_id=sid or "")
+                result = await gw.forward_with_jitter_retry(chat_body, account, session_id=sid or "")
             except (UpstreamAuthError, UpstreamQuotaError, UpstreamError) as err:
                 last_error = err
-                gw.pool.release(account, success=False, error=f"{type(err).__name__}: {err}")
-                if isinstance(err, UpstreamError) and not err.retryable:
+                gw.pool.release(account, success=False, error=f"{type(err).__name__}: {err}",
+                                blame_account=_blames_account(err))
+                # 406 已就地重试过，换号无意义；继续循环只会撞 NoAccountAvailable → 503。
+                if isinstance(err, UpstreamError) and (not err.retryable or err.status_code == 406):
                     break
                 continue
             except Exception as err:  # noqa: BLE001
                 last_error = err
-                gw.pool.release(account, success=False, error=f"{type(err).__name__}: {err}")
+                gw.pool.release(account, success=False, error=f"{type(err).__name__}: {err}",
+                                blame_account=_blames_account(err))
                 continue
 
             if is_stream:
                 return await _responses_stream(gw, auth, account, result, chat_body, model,
                                                response_id, created_at, started, client_ip)
+            # 非流式：forward_with_jitter_retry 已经把流读完并聚合成 JSON。
             return _responses_object(gw, auth, account, result, chat_body, model,
                                      response_id, created_at, started, client_ip)
 
@@ -785,6 +870,135 @@ def _nonstream_response(gw: Gateway, auth: ApiKey, account: Account, result: Any
     return JSONResponse(content=result)
 
 
+async def _peek_first(stream: Any) -> bytes:
+    """从上游流里取第一块（触发真正的请求），返回它。
+
+    `chat_stream()` 是异步生成器，创建它不发请求；上游的 406 要等到第一次
+    迭代才抛出来。重试逻辑必须先把这一块取出来确认成功，再把剩下的流转发出去。
+    空块会跳过（上游偶尔先发心跳），直到拿到非空的一块或流结束。
+    """
+    async for chunk in stream:
+        if chunk:
+            return chunk
+    return b""
+
+
+class _PrefixedStream:
+    """把「已经提前读出的一块」拼回流的开头，其余部分原样透传。"""
+
+    def __init__(self, first: bytes, rest: Any):
+        self._first = first
+        self._rest = rest
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        if self._first:
+            yield self._first
+        async for chunk in self._rest:
+            yield chunk
+
+
+async def collect_stream(stream: Any, *, model: str = "") -> dict:
+    """把上游 SSE 流聚合成一条完整的 chat.completion 响应体。
+
+    上游只肯给流式，而 OpenAI 客户端里 `stream: false` 仍是常见用法（比如
+    `curl`、脚本、批量任务）。这里逐字节读完整条流，再按 OpenAI 的增量语义
+    拼回一条非流式响应：
+
+    * `choices[i].delta.content` 按序拼接成 `choices[i].message.content`；
+    * `tool_calls` 按 `index` 归并（`function.arguments` 是分片到达的）；
+    * `role` / `finish_reason` 取第一次出现与最后一次非空的值；
+    * `usage` 取流里最后一个带它的分片（上游在末尾发）。
+
+    只在内存里聚合，不落盘；调用方要的是完整答案，不存在「中途断流也能用」。
+    """
+    content: list[str] = []
+    reasonings: list[str] = []
+    tool_calls: dict[int, dict] = {}
+    role = "assistant"
+    finish_reason: str | None = None
+    usage: dict = {}
+    response_id = ""
+    created = 0
+    model_name = model
+    buffer = b""
+
+    async for chunk in stream:
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == b"[DONE]":
+                continue
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("error"):
+                raise UpstreamError(f"上游流内报错：{event['error']}", retryable=True)
+            response_id = response_id or str(event.get("id") or "")
+            created = created or int(event.get("created") or 0)
+            model_name = model_name or str(event.get("model") or "")
+            if isinstance(event.get("usage"), dict):
+                usage = event["usage"]
+            for choice in event.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                if delta.get("role"):
+                    role = str(delta["role"])
+                if isinstance(delta.get("content"), str):
+                    content.append(delta["content"])
+                # 有些模型把思考过程单独发，拼回时并进 content 会污染正文，单列。
+                if isinstance(delta.get("reasoning_content"), str):
+                    reasonings.append(delta["reasoning_content"])
+                for call in delta.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    idx = int(call.get("index") or 0)
+                    slot = tool_calls.setdefault(
+                        idx, {"id": "", "type": "function",
+                              "function": {"name": "", "arguments": ""}})
+                    if call.get("id"):
+                        slot["id"] = str(call["id"])
+                    if call.get("type"):
+                        slot["type"] = str(call["type"])
+                    fn = call.get("function") or {}
+                    if isinstance(fn, dict):
+                        if fn.get("name"):
+                            slot["function"]["name"] += str(fn["name"])
+                        if isinstance(fn.get("arguments"), str):
+                            slot["function"]["arguments"] += fn["arguments"]
+                if choice.get("finish_reason"):
+                    finish_reason = str(choice["finish_reason"])
+
+    message: dict = {"role": role, "content": "".join(content) or None}
+    if reasonings:
+        message["reasoning_content"] = "".join(reasonings)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    result: dict = {
+        "id": response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": created or int(time.time()),
+        "model": model_name,
+        "choices": [{"index": 0, "message": message,
+                     "finish_reason": finish_reason or "stop"}],
+    }
+    if usage:
+        result["usage"] = usage
+    return result
+
+
 async def _stream_response(gw: Gateway, auth: ApiKey, account: Account, stream: Any,
                            body: dict, started: float, client_ip: str) -> StreamingResponse:
     """流式：逐字节透传上游 SSE 字节，结束时补齐账目。
@@ -804,6 +1018,7 @@ async def _stream_response(gw: Gateway, auth: ApiKey, account: Account, stream: 
         tokens = 0
         status = "ok"
         error = ""
+        blame_account = True
         try:
             async for chunk in stream:
                 yield chunk
@@ -829,6 +1044,7 @@ async def _stream_response(gw: Gateway, auth: ApiKey, account: Account, stream: 
                             status = "error"
         except UpstreamError as err:
             status, error = "error", f"{type(err).__name__}: {err}"
+            blame_account = _blames_account(err)
             # 已经在流里了，没法再改 HTTP 码：按 SSE 惯例补一个 error 事件。
             yield f"data: {json.dumps({'error': {'message': err.message, 'type': 'api_error'}}, ensure_ascii=False)}\n\n".encode()
             yield b"data: [DONE]\n\n"
@@ -846,7 +1062,8 @@ async def _stream_response(gw: Gateway, auth: ApiKey, account: Account, stream: 
             if status == "ok":
                 gw.note_usage()
             gw.pool.release(account, success=status in ("ok", "cancelled"),
-                            error=error if status == "error" else "")
+                            error=error if status == "error" else "",
+                            blame_account=blame_account)
             gw.log(UsageRecord(
                 ts=time.time(), key_name=auth.name, account_key=account.key,
                 model=str(body.get("model") or ""), stream=True, status=status,
@@ -918,6 +1135,7 @@ async def _responses_stream(gw: Gateway, auth: ApiKey, account: Account, stream:
         tokens = 0
         status = "ok"
         error = ""
+        blame_account = True
         translator = respmod.StreamTranslator(model, response_id=response_id,
                                               created_at=created_at)
         try:
@@ -936,6 +1154,7 @@ async def _responses_stream(gw: Gateway, auth: ApiKey, account: Account, stream:
                 yield out
         except UpstreamError as err:
             status, error = "error", f"{type(err).__name__}: {err}"
+            blame_account = _blames_account(err)
             for out in translator.fail(err.message):
                 yield out
         except (asyncio.CancelledError, GeneratorExit):
@@ -949,7 +1168,8 @@ async def _responses_stream(gw: Gateway, auth: ApiKey, account: Account, stream:
             if status == "ok":
                 gw.note_usage()
             gw.pool.release(account, success=status in ("ok", "cancelled"),
-                            error=error if status == "error" else "")
+                            error=error if status == "error" else "",
+                            blame_account=blame_account)
             gw.log(UsageRecord(
                 ts=time.time(), key_name=auth.name, account_key=account.key,
                 model=model, stream=True, status=status,

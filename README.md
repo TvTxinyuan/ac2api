@@ -131,11 +131,46 @@ key 也通，但每次对话都 `unexpected status 406 ... upstream 406`。
 `normalize_max_tokens()` 在转发前把值夹进区间（调用方给多少就夹多少，不擅自
 放宽；一个没给就不加），`max_completion_tokens` 统一成 `max_tokens`。
 
-> 排查建议：`406` 空 body 在上述四条规则里任一不满足都会出现，报错文本只提示了
-> 第一条。真遇到时依次确认：system 前缀 → `codex cli` 词 → `You are <竞品>`
-> 句式 → `max_tokens` 区间。
+#### 第五条 406 规则：整句竞品身份（DSH 踩的就是这条）
 
-自查一次四条规则是否都生效：
+DeepSeek Harness（DSH）的 system prompt 开场是这么一句：
+
+```
+You are an AI agent powered by DeepSeek Harness.
+```
+
+上游把它当成竞品身份声明，**整句命中就 406 空 body**。实测（真账号、前缀合规、
+每次只改追加的这一句）：
+
+| system 里出现 | 结果 |
+|---|---|
+| `You are an AI agent powered by DeepSeek Harness.` | **406** |
+| `you are an ai agent powered by deepseek harness`（全小写） | **406** |
+| 结尾没有句号 | **406** |
+| `You are an AI agent powered by X Harness.` | 200 |
+| `You are an AI agent powered by DeepSeek X.` | 200 |
+| `You are an AI assistant powered by DeepSeek Harness.` | 200 |
+| `Youre an AI agent powered by DeepSeek Harness.` | 200 |
+| `You are an  AI agent …`（**两个**空格） | 200 |
+| `DeepSeek` / `DeepSeek Harness` / `You are an AI agent` / `powered by` 单独出现 | 200 |
+
+和前几条一样是**字面子串**比较：整句连起来才拦，拆开或改动任一处词就放行；
+大小写不敏感，但内部必须是单个空格。所以这里只做大小写不敏感的替换，**不做
+空白归一化**——归一化反而会把上游本来放行的写法也改坏。
+
+`scrub_agent_lines()` 把它换成 `You are an AI agent`，`scrub_text()` 现在按
+「整句 → `You are <竞品>` 句式 → 竞品词」三道一起过。
+
+> 这条是 DSH 用户报 406 的直接原因。当时的误导在于：同一份请求体重放过一次
+> 200，于是先怀疑成「上游偶发风控」，又因为流式响应的 HTTP 码是 200（错误被
+> 装在 SSE 流里）而误判成「只有非流式失败」。**看 406 一定要看响应内容，不能
+> 只看状态码。**
+
+> 排查建议：`406` 空 body 在上述五条规则里任一不满足都会出现，报错文本只提示了
+> 第一条。真遇到时依次确认：system 前缀 → `codex cli` 词 → `You are <竞品>`
+> 句式 → `max_tokens` 区间 → 整句竞品身份。
+
+自查一次规则是否都生效：
 
 ```python
 from ac2api.upstream import ensure_system_prompt, normalize_max_tokens
@@ -409,9 +444,24 @@ Ed25519 签名」，于是把这些都试了一遍，全部无效：
   `You are <X>` 的各种 X 才定下来：只有 `codex` / `claude code` 两个词命中，必须是
   单个空格，只查 system。**它跟第 2 条是不同的规则**——`You are Codex.` 不含
   `codex cli` 这个子串，所以洗第 2 条时完全不会被碰到。
+- **第 5 条（DSH 那句）**：DSH 接进来后又是**每次** 406。这次走了两条弯路，值得记：
+
+  1. **同一份字节重放过一次 200**，于是先怀疑「上游偶发风控」，把 406 改成可重试
+     并在同账号上退避重试 —— 方向错了，重试 5 次全部 406，只是把 6.5 秒的等待
+     摊在每个请求上。
+  2. **流式响应的 HTTP 码是 200**，因为 SSE 已经开流、状态码改不了，406 被装在
+     `data: {"error": …}` 里。于是得出了「只有非流式才 406」的结论，还据此把非
+     流式全部改成「向上游要流式再聚合」—— 也是错的。**看 406 必须看响应内容。**
+
+  真正定位靠的是二分 system prompt 的正文：把 DSH 的 17103 字 system 逐句拆开单独
+  试，只有加上 `You are an AI agent powered by DeepSeek Harness.` 这一句会 406，
+  去掉就 200。再对这句话做逐词改动（换词、加空格、改大小写、去掉句号）才确认是
+  字面子串匹配。
 
 排查方法上唯一有效的一条：**把真正发往上游的 payload 落盘**（`AC2API_DEBUG_DUMP=<目录>`），
 然后拿它去逐项二分。所有假设都是被重放的 body 推翻或确认的，靠猜没有一次猜对。
+`AC2API_DEBUG_DUMP` 现在连上游的**错误响应**（状态码 + 响应头 + body）一起落盘，
+文件名叫 `*-resp<状态码>-<tag>.txt` —— 406 的 body 是空的，有时候线索只在响应头里。
 
 `ac2api/clawproxy.py`（伪装进程名借客户端代发）是绕这条弯路时写的，现在默认不启用，
 留作上游改规则时的兜底。
